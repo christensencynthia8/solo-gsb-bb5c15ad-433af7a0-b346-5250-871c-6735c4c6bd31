@@ -113,6 +113,25 @@ def _read_field(reader: BitReader, field: Dict[str, Any]) -> tuple[Any, Optional
     raise ParseError(f"unsupported field type: {ftype}")
 
 
+def _repeat_count(repeat: Dict[str, Any], values: Dict[str, Any], name: str) -> int:
+    """Repeat count = raw value of the referenced uint field; must not exceed
+    the declared max."""
+    count_field = repeat["field"]
+    if count_field not in values:
+        raise ParseError(
+            f"cannot determine repeat count for '{name}': field '{count_field}' "
+            f"was not parsed (skipped by an earlier branch)"
+        )
+    count = values[count_field]
+    max_count = repeat["max"]
+    if count > max_count:
+        raise ParseError(
+            f"repeat count for field '{name}' is {count}, exceeding the declared "
+            f"max {max_count}"
+        )
+    return count
+
+
 def parse_message(
     fields: List[Dict[str, Any]],
     checksum_cfg: Optional[Dict[str, Any]],
@@ -143,6 +162,31 @@ def parse_message(
                 continue
 
         bit_offset = reader.pos
+
+        repeat = field.get("repeat")
+        if repeat:
+            # Registration guarantees the count field is a non-repeated uint
+            # and that repeat fields are never the checksum field.
+            count = _repeat_count(repeat, values, name)
+            items: List[Any] = []
+            raws: List[int] = []
+            for _ in range(count):
+                item, item_raw = _read_field(reader, field)
+                items.append(item)
+                if item_raw is not None:
+                    raws.append(item_raw)
+            entry = {
+                "name": name,
+                "bit_offset": bit_offset,
+                "bit_length": field["bit_length"],  # per-element width
+                "count": count,
+                "value": items,
+            }
+            if field["type"] in ("uint", "int"):
+                entry["raw_value"] = raws
+            out_fields.append(entry)
+            continue
+
         value, raw = _read_field(reader, field)
         entry: Dict[str, Any] = {
             "name": name,

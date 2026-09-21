@@ -19,7 +19,9 @@ without needing concrete payloads:
    ``breaking`` and per-branch differences are returned.
 
 Combining more than :data:`MAX_COMBINATIONS` equivalence classes is rejected
-with :class:`CompatibilityError` (mapped to HTTP 422).
+with :class:`CompatibilityError` (mapped to HTTP 422). Definitions declaring
+``repeat`` fields are rejected as well: their layout is data-dependent, so a
+static layout comparison would be unsound.
 """
 
 import itertools
@@ -261,9 +263,20 @@ def analyze_compatibility(old_def: Dict[str, Any], new_def: Dict[str, Any]) -> D
     Returns a report with ``compatible`` (bool), equivalence-class metadata,
     and per-branch layouts/differences. Raises :class:`CompatibilityError`
     when the joint partition produces more than :data:`MAX_COMBINATIONS`
-    combinations, or when a control field's domains do not overlap.
+    combinations, when a control field's domains do not overlap, or when
+    either definition declares repeat fields (a dynamic layout cannot be
+    captured by the static layout comparison).
     """
     old_fields, new_fields = old_def["fields"], new_def["fields"]
+    for defn, label in ((old_def, "old"), (new_def, "new")):
+        for f in defn["fields"]:
+            if f.get("repeat"):
+                raise CompatibilityError(
+                    f"field '{f['name']}' in the {label} version "
+                    f"('{defn['version']}') declares a repeat; the layout is "
+                    f"data-dependent and static compatibility analysis cannot "
+                    f"be performed"
+                )
     old_checksum, new_checksum = old_def.get("checksum"), new_def.get("checksum")
     old_by_name, new_by_name = _field_index(old_fields), _field_index(new_fields)
     old_controls, new_controls = _control_fields(old_fields), _control_fields(new_fields)

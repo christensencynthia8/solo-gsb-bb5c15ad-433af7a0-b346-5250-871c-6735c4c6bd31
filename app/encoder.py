@@ -169,6 +169,25 @@ def _write_field(writer: BitWriter, field: Dict[str, Any], raw: int) -> None:
         writer.write(raw, field["bit_length"])
 
 
+def _repeat_count(repeat: Dict[str, Any], raw_values: Dict[str, Any], name: str) -> int:
+    """Same semantics as the parser: the count is the raw value of the
+    referenced uint field and must not exceed the declared max."""
+    count_field = repeat["field"]
+    if count_field not in raw_values:
+        raise EncodeError(
+            f"cannot determine repeat count for '{name}': field '{count_field}' "
+            f"was not encoded (skipped by an earlier branch)"
+        )
+    count = raw_values[count_field]
+    max_count = repeat["max"]
+    if count > max_count:
+        raise EncodeError(
+            f"repeat count for field '{name}' is {count}, exceeding the declared "
+            f"max {max_count}"
+        )
+    return count
+
+
 def encode_message(
     fields: List[Dict[str, Any]],
     checksum_cfg: Optional[Dict[str, Any]],
@@ -231,6 +250,44 @@ def encode_message(
                 "calculated": calculated,
                 "calculated_hex": f"0x{calculated:0{field['bit_length'] // 4}x}",
             }
+            continue
+
+        repeat = field.get("repeat")
+        if repeat:
+            # Registration guarantees the count field is a non-repeated uint
+            # and that repeat fields are never the checksum field.
+            count = _repeat_count(repeat, raw_values, name)
+            if name not in values:
+                raise EncodeError(f"missing value for field '{name}'")
+            consumed.add(name)
+            items = values[name]
+            if not isinstance(items, list):
+                raise EncodeError(
+                    f"field '{name}': expected an array of exactly {count} value(s)"
+                )
+            if len(items) != count:
+                raise EncodeError(
+                    f"field '{name}': expected exactly {count} element(s) to match "
+                    f"'{repeat['field']}' = {count}, got {len(items)}"
+                )
+            displays: List[Any] = []
+            raws: List[int] = []
+            for item in items:
+                display, raw = _to_raw(field, item)
+                _write_field(writer, field, raw)
+                displays.append(display)
+                if raw is not None:
+                    raws.append(raw)
+            entry = {
+                "name": name,
+                "bit_offset": bit_offset,
+                "bit_length": field["bit_length"],  # per-element width
+                "count": count,
+                "value": displays,
+            }
+            if field["type"] in ("uint", "int"):
+                entry["raw_value"] = raws
+            out_fields.append(entry)
             continue
 
         if name not in values:

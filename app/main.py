@@ -30,7 +30,8 @@ app = FastAPI(
     title="Industrial Binary Message Parser",
     description=(
         "Register versioned binary message definitions (bit widths, endianness, "
-        "conditional branches, checksums) and parse hex payloads against them."
+        "conditional branches, repeated fields, checksums) and parse hex "
+        "payloads against them."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -125,7 +126,8 @@ def compatibility(device_type: str, req: CompatibilityRequest):
     each old-version layout must find a new-version layout with identical
     field names/types/bit widths/offsets, total length and checksum algorithm.
     Returns ``breaking`` with per-branch differences otherwise; more than 256
-    equivalence-class combinations yields 422."""
+    equivalence-class combinations yields 422, as does a definition declaring
+    repeat fields (their layout is data-dependent)."""
     if req.old_version == req.new_version:
         raise HTTPException(
             status_code=422,

@@ -13,6 +13,12 @@ class Condition(BaseModel):
     value: Union[int, List[int]]
 
 
+class RepeatDef(BaseModel):
+    # The repeat count is the raw value of a previously defined uint field.
+    field: str
+    max: int = Field(ge=1, le=64)
+
+
 class FieldDef(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     type: Literal["uint", "int", "bool", "hex", "ascii"] = "uint"
@@ -21,6 +27,7 @@ class FieldDef(BaseModel):
     scale: Optional[float] = None
     offset: Optional[float] = None
     condition: Optional[Condition] = None
+    repeat: Optional[RepeatDef] = None
 
 
 class ChecksumDef(BaseModel):
@@ -71,6 +78,7 @@ def validate_definition(defn: DefinitionCreate) -> None:
 
     seen: set[str] = set()
     numeric_seen: set[str] = set()  # fields usable in conditions
+    by_name: Dict[str, FieldDef] = {}  # previously defined fields
     for f in defn.fields:
         if f.name in seen:
             raise ValueError(f"duplicate field name: '{f.name}'")
@@ -95,8 +103,31 @@ def validate_definition(defn: DefinitionCreate) -> None:
             raise ValueError(
                 f"field '{f.name}': scale/offset only apply to uint/int fields"
             )
+        if f.repeat:
+            r = f.repeat
+            ref = by_name.get(r.field)
+            if ref is None:
+                raise ValueError(
+                    f"field '{f.name}': repeat references '{r.field}', which is not a "
+                    f"previously defined field"
+                )
+            if ref.type != "uint":
+                raise ValueError(
+                    f"field '{f.name}': repeat count field '{r.field}' must be of type "
+                    f"uint, got '{ref.type}'"
+                )
+            if ref.repeat is not None:
+                raise ValueError(
+                    f"field '{f.name}': repeat count field '{r.field}' must not "
+                    f"itself be repeated"
+                )
         if f.condition:
             c = f.condition
+            if c.field in by_name and by_name[c.field].repeat is not None:
+                raise ValueError(
+                    f"field '{f.name}': condition references '{c.field}', which is a "
+                    f"repeated field and cannot be used in conditions"
+                )
             if c.field not in numeric_seen:
                 raise ValueError(
                     f"field '{f.name}': condition references '{c.field}', which is not a "
@@ -110,8 +141,11 @@ def validate_definition(defn: DefinitionCreate) -> None:
                 raise ValueError(
                     f"field '{f.name}': operator '{c.op}' requires an integer value"
                 )
-        if f.type in ("uint", "int", "bool"):
+        # Repeated fields produce arrays, so they can never feed conditions or
+        # repeat counts; keep them out of the referenceable sets.
+        if f.type in ("uint", "int", "bool") and f.repeat is None:
             numeric_seen.add(f.name)
+        by_name[f.name] = f
 
     if defn.checksum:
         target = next((f for f in defn.fields if f.name == defn.checksum.field), None)
@@ -121,6 +155,8 @@ def validate_definition(defn: DefinitionCreate) -> None:
             )
         if target.type != "uint":
             raise ValueError(f"checksum field '{target.name}' must be of type uint")
+        if target.repeat is not None:
+            raise ValueError(f"checksum field '{target.name}' must not be repeated")
         _, width = ALGORITHMS[defn.checksum.algorithm]
         if target.bit_length != width:
             raise ValueError(
