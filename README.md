@@ -1,6 +1,6 @@
 # 工业二进制报文解析 API
 
-基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。SQLite 持久化，启动时自动建表。
+基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。SQLite 持久化，启动时自动建表。
 
 ## 快速启动
 
@@ -54,8 +54,18 @@ docker compose up --build
 | `endianness` | `big`（默认）/ `little`，仅对多字节 `uint`/`int` 有效                |
 | `scale`/`offset` | 可选，仅数值字段：`value = raw * scale + offset`                 |
 | `condition`  | 可选，条件不满足时跳过该字段（条件比较的是**原始值 raw**，非缩放值） |
+| `repeat`     | 可选，形如 `{"field": "count", "max": 8}`：字段按前置计数字段的原始值重复，详见下文 |
 
-**条件操作符**：`eq` `ne` `gt` `ge` `lt` `le` `in`（`in` 的 `value` 为整数数组）。条件只能引用**之前定义**的数值/布尔字段。
+**条件操作符**：`eq` `ne` `gt` `ge` `lt` `le` `in`（`in` 的 `value` 为整数数组）。条件只能引用**之前定义**的标量数值/布尔字段。
+
+**重复字段（repeat）**
+
+- `repeat.field` 必须引用**之前定义的标量 `uint` 字段**（计数字段）；解析/编码时取该字段的**原始值 raw**作为重复次数。
+- `repeat.max` 取值范围 **1～64**；运行时计数超过 `max` 返回 422。
+- 重复字段可以是任意类型（含 `ascii`/`hex`/`bool`、支持小端与 `scale`/`offset`），可以同时带 `condition`：**条件未命中时不展开**任何重复项；命中后重复段长度（`count × bit_length`）正确推动后续字段与校验字段的偏移。
+- 计数字段本身被更早的条件跳过时，重复无法确定，返回 422。
+- 重复字段是数组，**不能**再被后续条件/计数引用；校验字段本身不能声明为重复字段。
+- 校验和算法的计算范围天然覆盖展开后的全部字节（校验字段位于重复段之后时偏移随之顺延）。
 
 **校验和算法**：`sum8`、`xor8`、`crc16-ccitt`（8 位字段用前两者，16 位字段用后两者）。计算范围为校验字段之前的全部字节，校验字段需字节对齐。
 
@@ -68,7 +78,7 @@ docker compose up --build
 | GET  | `/api/v1/definitions/{device_type}/latest` | 查询该设备类型最新**启用**版本 |
 | GET  | `/api/v1/definitions/{device_type}/{version}` | 查询指定版本 |
 | POST | `/api/v1/definitions/{device_type}/{version}/deactivate` | 停用定义 |
-| POST | `/api/v1/definitions/{device_type}/compatibility` | 两个已注册版本的报文布局兼容性分析（>256 个等价类组合返回 422） |
+| POST | `/api/v1/definitions/{device_type}/compatibility` | 两个已注册版本的报文布局兼容性分析（>256 个等价类组合或任一版本含 `repeat` 定义返回 422） |
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
@@ -171,11 +181,88 @@ curl -X POST http://localhost:8000/api/v1/encode \
 **编码规则**
 
 - `values` 中各值采用**解析响应的类型**：`uint`/`int` 为整数（带 `scale`/`offset` 时可为浮点数），`bool` 为布尔值，`hex` 为 `"0x..."` 字符串，`ascii` 为字符串（长度须等于 `bit_length/8`）。
+- 重复字段的值为**数组**，长度必须与计数字段的 raw 值**完全一致**（计数为 0 时传 `[]`，传标量或长度不符均返回 422）；逐元素套用类型/范围/scale 反算规则，错误信息会标出下标（如 `samples[1]`）。
 - 带 `scale`/`offset` 的数值按 `raw = (value - offset) / scale` 反算；无法精确还原或 raw 超出位宽范围时返回 422。
 - 条件判断统一使用 **raw**（与 parse 一致）：条件未命中的字段不要求输入（提供了也返回 422）；命中字段缺失、出现未知字段均返回 422。
 - 校验字段**不接受调用方赋值**，服务在其位置自动计算写入；校验位置未字节对齐时返回 422。
 
-### 4. 列表 / 最新版本 / 停用
+### 4. 重复字段（repeat）：变长数组
+
+定义中 `count` 是普通 uint 字段，`samples` 通过 `repeat` 声明由它的原始值决定重复次数（上限 8）：
+
+```json
+{
+  "device_type": "array_dev",
+  "version": "1.0.0",
+  "fields": [
+    {"name": "header",  "type": "uint", "bit_length": 8},
+    {"name": "count",   "type": "uint", "bit_length": 8},
+    {"name": "samples", "type": "uint", "bit_length": 16, "endianness": "little",
+     "scale": 0.1, "repeat": {"field": "count", "max": 8}},
+    {"name": "crc",     "type": "uint", "bit_length": 16}
+  ],
+  "checksum": {"field": "crc", "algorithm": "crc16-ccitt"}
+}
+```
+
+报文 `aa03e800d00710270236`：`header=0xAA`，`count=3`，后跟 3 个小端 int16 采样值 raw `232 / 2000 / 10000`（即 23.2、200.0、1000.0），最后 2 字节 CRC。
+
+```bash
+# 注册
+curl -X POST http://localhost:8000/api/v1/definitions \
+  -H 'Content-Type: application/json' \
+  -d '{ "device_type": "array_dev", "version": "1.0.0",
+        "fields": [
+          {"name": "header",  "type": "uint", "bit_length": 8},
+          {"name": "count",   "type": "uint", "bit_length": 8},
+          {"name": "samples", "type": "uint", "bit_length": 16, "endianness": "little",
+           "scale": 0.1, "repeat": {"field": "count", "max": 8}},
+          {"name": "crc",     "type": "uint", "bit_length": 16}
+        ],
+        "checksum": {"field": "crc", "algorithm": "crc16-ccitt"} }'
+
+# 解析（value / raw_value 为数组，count 为实际重复次数）
+curl -X POST http://localhost:8000/api/v1/parse \
+  -H 'Content-Type: application/json' \
+  -d '{"device_type": "array_dev", "version": "1.0.0", "hex": "aa03e800d00710270236"}'
+```
+
+响应（节选）：
+
+```json
+{
+  "fields": [
+    {"name": "header",  "bit_offset": 0,  "bit_length": 8,  "value": 170},
+    {"name": "count",   "bit_offset": 8,  "bit_length": 8,  "value": 3},
+    {"name": "samples", "bit_offset": 16, "bit_length": 16, "count": 3,
+     "value": [23.2, 200.0, 1000.0], "raw_value": [232, 2000, 10000]},
+    {"name": "crc",     "bit_offset": 64, "bit_length": 16, "value": 566}
+  ],
+  "consumed_bits": 80, "trailing_bits": 0
+}
+```
+
+- `bit_length` 仍是**单个元素**的位宽；重复段总位数为 `count × bit_length`，后续字段（含校验字段）的偏移随之顺延。
+- 计数为 0 时该字段返回 `"value": []`（数值字段同时有 `"raw_value": []`），不占用报文位。
+- 编码时数组长度必须与 `count` 完全一致：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/encode \
+  -H 'Content-Type: application/json' \
+  -d '{"device_type": "array_dev", "version": "1.0.0",
+       "values": {"header": 170, "count": 3, "samples": [23.2, 200.0, 1000.0]}}'
+# -> {"hex": "aa03e800d00710270236", ...}
+
+# count=0 的报文：aa00 + crc16-ccitt(aa00) = aa00efba
+curl -X POST http://localhost:8000/api/v1/encode \
+  -H 'Content-Type: application/json' \
+  -d '{"device_type": "array_dev", "version": "1.0.0",
+       "values": {"header": 170, "count": 0, "samples": []}}'
+```
+
+返回 422 的情形：运行时计数超过声明的 `max`、编码数组长度与计数不一致（或不是数组）、重复段超出报文长度、计数字段被更早的条件分支跳过。注册时若计数引用不是前置标量 `uint`、`max` 不在 1～64、重复字段被后续条件引用或校验字段声明为重复，同样返回 422。
+
+### 5. 列表 / 最新版本 / 停用
 
 ```bash
 # 列出全部启用中的定义（可加 ?device_type=temp_sensor 或 ?include_inactive=true）
@@ -188,7 +275,7 @@ curl http://localhost:8000/api/v1/definitions/temp_sensor/latest
 curl -X POST http://localhost:8000/api/v1/definitions/temp_sensor/1.0.0/deactivate
 ```
 
-### 5. 版本兼容性分析
+### 6. 版本兼容性分析
 
 比较同一 `device_type` 的两个**已注册**版本（无需提供报文）。分析器：
 
@@ -196,7 +283,7 @@ curl -X POST http://localhost:8000/api/v1/definitions/temp_sensor/1.0.0/deactiva
 2. 枚举各控制字段等价类代表值的笛卡尔积，对每个可达组合**模拟布局**：按条件保留/跳过字段，计算每个字段的位偏移与布局总长度（条件引用的字段被更早分支跳过时该组合不可达，自动跳过）；
 3. 对旧版每个可达布局，在新版的**相同条件代表值**下寻找对应布局：字段名称、类型、位宽、位偏移、总长度及校验算法必须全部一致。任一旧布局找不到对应布局即判为 `breaking`，逐分支返回差异；否则判为 `compatible`。
 
-等价类组合总数超过 **256** 时返回 `422`（边界值 256 正常分析）。
+等价类组合总数超过 **256** 时返回 `422`（边界值 256 正常分析）。**任一版本含 `repeat` 定义时也直接返回 422**：重复长度由运行时计数值决定，无法在不提供报文的情况下给出静态布局结论，因此拒绝分析而不是给出可能误导的判定。
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/definitions/temp_sensor/compatibility \
@@ -253,7 +340,7 @@ curl -X POST http://localhost:8000/api/v1/definitions/temp_sensor/compatibility 
 
 两版本对同一控制字段的位宽不同时，按两者原始值域的**交集**划分（无交集返回 422）；新版新增控制字段或删除旧控制字段时，仅在受影响的等价类上产生差异，未受影响分支仍可判为兼容。
 
-### 6. 自动识别版本（/detect）
+### 7. 自动识别版本（/detect）
 
 收到报文但不知道版本时，调用 `/api/v1/detect`。请求体**只含** `device_type` 与 `hex`（不接受 `version`，多余字段返回 422）；服务会取出该设备类型下**全部已注册版本（含停用版本）**，按版本顺序逐一解析：
 
@@ -328,9 +415,9 @@ pytest                               # 运行测试
 app/
   main.py       # FastAPI 路由与生命周期
   schemas.py    # 请求模型与定义语义校验
-  parser.py     # 按位解析器（位读取、条件分支、校验和验证）
-  encoder.py    # 按位编码器（位写入、scale/offset 反算、校验和自动写入）
-  analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对）
+  parser.py     # 按位解析器（位读取、条件分支、repeat 数组展开、校验和验证）
+  encoder.py    # 按位编码器（位写入、scale/offset 反算、repeat 数组、校验和自动写入）
+  analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus
   database.py   # SQLite 持久化（启动自动建表）
 tests/test_api.py

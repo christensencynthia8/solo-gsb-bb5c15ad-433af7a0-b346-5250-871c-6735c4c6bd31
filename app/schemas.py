@@ -13,6 +13,13 @@ class Condition(BaseModel):
     value: Union[int, List[int]]
 
 
+class RepeatSpec(BaseModel):
+    # The field is repeated `count` times, where `count` is the raw value of a
+    # previously defined scalar uint field; `max` bounds that runtime count.
+    field: str
+    max: int = Field(ge=1, le=64)
+
+
 class FieldDef(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     type: Literal["uint", "int", "bool", "hex", "ascii"] = "uint"
@@ -21,6 +28,7 @@ class FieldDef(BaseModel):
     scale: Optional[float] = None
     offset: Optional[float] = None
     condition: Optional[Condition] = None
+    repeat: Optional[RepeatSpec] = None
 
 
 class ChecksumDef(BaseModel):
@@ -70,7 +78,8 @@ def validate_definition(defn: DefinitionCreate) -> None:
         raise ValueError("fields must not be empty")
 
     seen: set[str] = set()
-    numeric_seen: set[str] = set()  # fields usable in conditions
+    numeric_seen: set[str] = set()  # scalar fields usable in conditions
+    uint_seen: set[str] = set()  # scalar uint fields usable as repeat counters
     for f in defn.fields:
         if f.name in seen:
             raise ValueError(f"duplicate field name: '{f.name}'")
@@ -100,7 +109,7 @@ def validate_definition(defn: DefinitionCreate) -> None:
             if c.field not in numeric_seen:
                 raise ValueError(
                     f"field '{f.name}': condition references '{c.field}', which is not a "
-                    f"previously defined uint/int/bool field"
+                    f"previously defined scalar uint/int/bool field"
                 )
             if c.op == "in" and not isinstance(c.value, list):
                 raise ValueError(
@@ -110,14 +119,32 @@ def validate_definition(defn: DefinitionCreate) -> None:
                 raise ValueError(
                     f"field '{f.name}': operator '{c.op}' requires an integer value"
                 )
-        if f.type in ("uint", "int", "bool"):
+        if f.repeat:
+            r = f.repeat
+            if r.field not in uint_seen:
+                raise ValueError(
+                    f"field '{f.name}': repeat counter '{r.field}' must be a previously "
+                    f"defined scalar uint field"
+                )
+            if r.field == f.name:
+                raise ValueError(
+                    f"field '{f.name}': repeat counter must reference an earlier field"
+                )
+            # repeated fields are arrays and cannot drive later conditions/counters
+        elif f.type in ("uint", "int", "bool"):
             numeric_seen.add(f.name)
+            if f.type == "uint":
+                uint_seen.add(f.name)
 
     if defn.checksum:
         target = next((f for f in defn.fields if f.name == defn.checksum.field), None)
         if target is None:
             raise ValueError(
                 f"checksum field '{defn.checksum.field}' is not defined in fields"
+            )
+        if target.repeat is not None:
+            raise ValueError(
+                f"checksum field '{target.name}' must not be a repeated field"
             )
         if target.type != "uint":
             raise ValueError(f"checksum field '{target.name}' must be of type uint")

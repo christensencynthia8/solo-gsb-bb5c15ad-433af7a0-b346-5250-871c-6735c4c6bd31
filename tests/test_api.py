@@ -1017,3 +1017,359 @@ def test_compatibility_nested_conditional_unreachable_combinations_skipped():
     )
     assert [f["name"] for f in c2_branch["old_layout"]["fields"]] == ["t", "c1", "c2"]
     assert c2_branch["old_layout"]["total_bits"] == 20
+
+
+# ------------------------------------------------------------------ repeats --
+
+
+REPEAT_DEF = {
+    "device_type": "array_dev",
+    "version": "1.0.0",
+    "description": "传感器采样数组报文",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "count", "type": "uint", "bit_length": 8},
+        {
+            "name": "samples",
+            "type": "uint",
+            "bit_length": 16,
+            "endianness": "little",
+            "scale": 0.1,
+            "repeat": {"field": "count", "max": 8},
+        },
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+
+
+def _register_repeat():
+    resp = client.post("/api/v1/definitions", json=REPEAT_DEF)
+    assert resp.status_code == 201, resp.text
+
+
+def _repeat_hex(samples):
+    body = bytes([0xAA, len(samples)]) + b"".join(
+        int(round(s * 10)).to_bytes(2, "little") for s in samples
+    )
+    return (body + crc16_ccitt(body).to_bytes(2, "big")).hex()
+
+
+def test_register_repeat_validation():
+    _register_repeat()
+
+    def bad(fields, version):
+        return client.post(
+            "/api/v1/definitions",
+            json={"device_type": "rep_bad", "version": version, "fields": fields},
+        )
+
+    # counter must be an earlier scalar uint field
+    assert bad(
+        [{"name": "a", "type": "int", "bit_length": 8},
+         {"name": "r", "type": "uint", "bit_length": 8, "repeat": {"field": "a", "max": 4}}],
+        "1.0.0",
+    ).status_code == 422
+    # forward / unknown reference
+    assert bad(
+        [{"name": "r", "type": "uint", "bit_length": 8, "repeat": {"field": "ghost", "max": 4}}],
+        "2.0.0",
+    ).status_code == 422
+    # self reference
+    assert bad(
+        [{"name": "r", "type": "uint", "bit_length": 8, "repeat": {"field": "r", "max": 4}}],
+        "3.0.0",
+    ).status_code == 422
+    # max out of [1, 64]
+    assert bad(
+        [{"name": "a", "type": "uint", "bit_length": 8},
+         {"name": "r", "type": "uint", "bit_length": 8, "repeat": {"field": "a", "max": 0}}],
+        "4.0.0",
+    ).status_code == 422
+    assert bad(
+        [{"name": "a", "type": "uint", "bit_length": 8},
+         {"name": "r", "type": "uint", "bit_length": 8, "repeat": {"field": "a", "max": 65}}],
+        "5.0.0",
+    ).status_code == 422
+    # a repeated field cannot drive later conditions
+    assert bad(
+        [
+            {"name": "a", "type": "uint", "bit_length": 8},
+            {"name": "r", "type": "uint", "bit_length": 8, "repeat": {"field": "a", "max": 4}},
+            {"name": "x", "type": "uint", "bit_length": 8,
+             "condition": {"field": "r", "op": "eq", "value": 1}},
+        ],
+        "6.0.0",
+    ).status_code == 422
+    # ... nor serve as another counter
+    assert bad(
+        [
+            {"name": "a", "type": "uint", "bit_length": 8},
+            {"name": "r", "type": "uint", "bit_length": 8, "repeat": {"field": "a", "max": 4}},
+            {"name": "r2", "type": "uint", "bit_length": 8, "repeat": {"field": "r", "max": 4}},
+        ],
+        "7.0.0",
+    ).status_code == 422
+    # the checksum field itself must not be repeated
+    resp = client.post(
+        "/api/v1/definitions",
+        json={
+            "device_type": "rep_bad",
+            "version": "8.0.0",
+            "fields": [
+                {"name": "a", "type": "uint", "bit_length": 8},
+                {"name": "cs", "type": "uint", "bit_length": 8,
+                 "repeat": {"field": "a", "max": 4}},
+            ],
+            "checksum": {"field": "cs", "algorithm": "sum8"},
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_parse_repeated_field_arrays_and_offsets():
+    samples = [23.2, 200.0, 1000.0]  # raws 232, 2000, 10000
+    resp = client.post(
+        "/api/v1/parse",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": _repeat_hex(samples)},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    fields = {f["name"]: f for f in data["fields"]}
+
+    rep = fields["samples"]
+    assert rep["bit_offset"] == 16
+    assert rep["bit_length"] == 16  # per-element width
+    assert rep["count"] == 3
+    assert rep["value"] == samples
+    assert rep["raw_value"] == [232, 2000, 10000]
+
+    # repeats push later fields and the checksum position forward
+    assert fields["crc"]["bit_offset"] == 16 + 3 * 16
+    assert data["consumed_bits"] == 16 + 3 * 16 + 16
+    assert data["trailing_bits"] == 0
+    assert data["checksum"]["valid"] is True
+    assert data["checksum"]["range"] == f"bytes [0, {fields['crc']['bit_offset'] // 8})"
+
+
+def test_parse_repeated_zero_count():
+    resp = client.post(
+        "/api/v1/parse",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": _repeat_hex([])},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    fields = {f["name"]: f for f in data["fields"]}
+    rep = fields["samples"]
+    assert rep["count"] == 0
+    assert rep["value"] == []
+    assert rep["raw_value"] == []
+    assert rep["bit_offset"] == 16
+    assert fields["crc"]["bit_offset"] == 16  # nothing expanded
+    assert data["consumed_bits"] == 32
+    assert data["checksum"]["valid"] is True
+
+
+def test_parse_repeat_count_over_max_422():
+    # count byte = 9 > max 8; payload deliberately short as well
+    resp = client.post(
+        "/api/v1/parse",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": "aa09"},
+    )
+    assert resp.status_code == 422
+    assert "exceeds the declared maximum" in resp.json()["detail"]
+
+
+def test_parse_repeat_message_too_short_422():
+    # count = 2 but no sample bytes follow
+    resp = client.post(
+        "/api/v1/parse",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": "aa023412"},
+    )
+    assert resp.status_code == 422
+    assert "message too short" in resp.json()["detail"]
+
+
+def test_parse_repeat_counter_skipped_by_branch_422():
+    payload = {
+        "device_type": "rep_skip",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "kind", "type": "uint", "bit_length": 8},
+            {"name": "n", "type": "uint", "bit_length": 8,
+             "condition": {"field": "kind", "op": "eq", "value": 1}},
+            {"name": "tags", "type": "uint", "bit_length": 8,
+             "repeat": {"field": "n", "max": 4}},
+        ],
+    }
+    assert client.post("/api/v1/definitions", json=payload).status_code == 201
+    # kind != 1 -> counter n absent -> repeat cannot be resolved
+    resp = client.post(
+        "/api/v1/parse", json={"device_type": "rep_skip", "hex": "00"}
+    )
+    assert resp.status_code == 422
+    assert "repeat counter 'n' was not parsed" in resp.json()["detail"]
+
+
+def test_parse_repeat_behind_condition_not_expanded_when_missed():
+    payload = {
+        "device_type": "rep_cond",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "kind", "type": "uint", "bit_length": 8},
+            {"name": "n", "type": "uint", "bit_length": 8},
+            {"name": "tags", "type": "ascii", "bit_length": 8,
+             "repeat": {"field": "n", "max": 4},
+             "condition": {"field": "kind", "op": "eq", "value": 1}},
+        ],
+    }
+    assert client.post("/api/v1/definitions", json=payload).status_code == 201
+
+    # condition missed: n's value must not expand tags
+    resp = client.post("/api/v1/parse", json={"device_type": "rep_cond", "hex": "0002"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert [f["name"] for f in data["fields"]] == ["kind", "n"]
+    assert data["consumed_bits"] == 16
+
+    # condition hit: tags = ["A", "B"]
+    resp = client.post("/api/v1/parse", json={"device_type": "rep_cond", "hex": "01024142"})
+    assert resp.status_code == 200
+    fields = {f["name"]: f for f in resp.json()["fields"]}
+    assert fields["tags"]["value"] == ["A", "B"]
+    assert fields["tags"]["count"] == 2
+
+
+def test_encode_repeated_field_roundtrip():
+    samples = [23.2, 200.0, 1000.0]
+    expected_hex = _repeat_hex(samples)
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "array_dev",
+            "version": "1.0.0",
+            "values": {"header": 0xAA, "count": 3, "samples": samples},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["hex"] == expected_hex
+    fields = {f["name"]: f for f in data["fields"]}
+    assert fields["samples"]["value"] == samples
+    assert fields["samples"]["raw_value"] == [232, 2000, 10000]
+    assert fields["samples"]["count"] == 3
+    assert fields["crc"]["bit_offset"] == 64
+
+    # parses back identically
+    resp = client.post(
+        "/api/v1/parse",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": data["hex"]},
+    )
+    assert resp.status_code == 200
+    rep = {f["name"]: f for f in resp.json()["fields"]}["samples"]
+    assert rep["value"] == samples
+    assert resp.json()["checksum"]["valid"] is True
+
+
+def test_encode_repeated_zero_count_requires_empty_list():
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "array_dev", "values": {"header": 0xAA, "count": 0, "samples": []}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hex"] == _repeat_hex([])
+
+    # count == 0 but a non-empty list is supplied
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "array_dev",
+              "values": {"header": 0xAA, "count": 0, "samples": [1.0]}},
+    )
+    assert resp.status_code == 422
+    assert "exactly 0" in resp.json()["detail"]
+
+
+def test_encode_repeated_array_length_mismatch_422():
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "array_dev",
+            "values": {"header": 0xAA, "count": 3, "samples": [1.0, 2.0]},
+        },
+    )
+    assert resp.status_code == 422
+    assert "exactly 3" in resp.json()["detail"]
+
+
+def test_encode_repeated_value_must_be_list_422():
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "array_dev",
+              "values": {"header": 0xAA, "count": 3, "samples": 1.0}},
+    )
+    assert resp.status_code == 422
+    assert "expected a list" in resp.json()["detail"]
+
+
+def test_encode_repeated_element_type_and_range_422():
+    # one element is a string where an integer/float is required
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "array_dev",
+            "values": {"header": 0xAA, "count": 2, "samples": [1.0, "nope"]},
+        },
+    )
+    assert resp.status_code == 422
+    assert "samples[1]" in resp.json()["detail"]
+
+    # one element's raw value does not fit in uint16
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "array_dev",
+            "values": {"header": 0xAA, "count": 1, "samples": [70000.0]},
+        },
+    )
+    assert resp.status_code == 422
+    assert "samples[0]" in resp.json()["detail"]
+
+
+def test_encode_repeat_count_over_max_422():
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "array_dev",
+            "values": {"header": 0xAA, "count": 9, "samples": [0.0] * 9},
+        },
+    )
+    assert resp.status_code == 422
+    assert "exceeds the declared maximum" in resp.json()["detail"]
+
+
+def test_compatibility_rejects_repeat_definitions_422():
+    # array_dev 1.0.0 carries a repeat declaration
+    payload = dict(REPEAT_DEF)
+    payload["version"] = "2.0.0"
+    assert client.post("/api/v1/definitions", json=payload).status_code == 201
+
+    resp = _compat("array_dev", "1.0.0", "2.0.0")
+    assert resp.status_code == 422
+    assert "repeated" in resp.json()["detail"]
+
+    # even comparing against a definition without repeats is refused when
+    # either side contains one
+    plain = {
+        "device_type": "array_dev",
+        "version": "3.0.0",
+        "fields": [
+            {"name": "header", "type": "uint", "bit_length": 8},
+            {"name": "count", "type": "uint", "bit_length": 8},
+            {"name": "crc", "type": "uint", "bit_length": 16},
+        ],
+        "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+    }
+    assert client.post("/api/v1/definitions", json=plain).status_code == 201
+    resp = _compat("array_dev", "3.0.0", "1.0.0")
+    assert resp.status_code == 422
+    assert "repeated" in resp.json()["detail"]

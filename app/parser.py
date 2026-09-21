@@ -113,6 +113,37 @@ def _read_field(reader: BitReader, field: Dict[str, Any]) -> tuple[Any, Optional
     raise ParseError(f"unsupported field type: {ftype}")
 
 
+def resolve_repeat_count(
+    field_name: str,
+    repeat: Dict[str, Any],
+    raw_values: Dict[str, Any],
+    error_cls: type = ParseError,
+) -> int:
+    """Resolve the runtime repetition count from a preceding scalar uint field.
+
+    The referenced field must have been present on this branch and its raw
+    value must not exceed the registration-time ``max``.
+    """
+    counter = repeat["field"]
+    if counter not in raw_values:
+        raise error_cls(
+            f"field '{field_name}': repeat counter '{counter}' was not parsed "
+            f"(skipped by an earlier branch)"
+        )
+    count = raw_values[counter]
+    maximum = repeat["max"]
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        raise error_cls(
+            f"field '{field_name}': repeat counter '{counter}' has an invalid raw value {count!r}"
+        )
+    if count > maximum:
+        raise error_cls(
+            f"field '{field_name}': repeat count {count} from '{counter}' exceeds the "
+            f"declared maximum of {maximum}"
+        )
+    return count
+
+
 def parse_message(
     fields: List[Dict[str, Any]],
     checksum_cfg: Optional[Dict[str, Any]],
@@ -143,8 +174,32 @@ def parse_message(
                 continue
 
         bit_offset = reader.pos
+        repeat = field.get("repeat")
+
+        if repeat is not None:
+            count = resolve_repeat_count(name, repeat, values)
+            values_list: List[Any] = []
+            raws_list: List[Any] = []
+            for _ in range(count):
+                value, raw = _read_field(reader, field)
+                values_list.append(value)
+                if raw is not None:
+                    raws_list.append(raw)
+            entry: Dict[str, Any] = {
+                "name": name,
+                "bit_offset": bit_offset,
+                "bit_length": field["bit_length"],
+                "count": count,
+                "value": values_list,
+            }
+            if field["type"] in ("uint", "int"):
+                entry["raw_value"] = raws_list
+            out_fields.append(entry)
+            # repeated fields are arrays: never used as condition/counter sources
+            continue
+
         value, raw = _read_field(reader, field)
-        entry: Dict[str, Any] = {
+        entry = {
             "name": name,
             "bit_offset": bit_offset,
             "bit_length": field["bit_length"],

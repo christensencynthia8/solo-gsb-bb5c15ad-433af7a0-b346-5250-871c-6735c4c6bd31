@@ -265,6 +265,18 @@ def analyze_compatibility(old_def: Dict[str, Any], new_def: Dict[str, Any]) -> D
     """
     old_fields, new_fields = old_def["fields"], new_def["fields"]
     old_checksum, new_checksum = old_def.get("checksum"), new_def.get("checksum")
+
+    # Repeat-driven layouts depend on runtime counter values, so no finite set
+    # of static layouts can be concluded. Refuse instead of giving a possibly
+    # wrong compatibility verdict.
+    for label, fields in (("old", old_fields), ("new", new_fields)):
+        repeated = [f["name"] for f in fields if f.get("repeat")]
+        if repeated:
+            raise CompatibilityError(
+                f"compatibility analysis does not support repeated fields; the {label} "
+                f"definition contains repeat declaration(s) on: {', '.join(repeated)}"
+            )
+
     old_by_name, new_by_name = _field_index(old_fields), _field_index(new_fields)
     old_controls, new_controls = _control_fields(old_fields), _control_fields(new_fields)
 

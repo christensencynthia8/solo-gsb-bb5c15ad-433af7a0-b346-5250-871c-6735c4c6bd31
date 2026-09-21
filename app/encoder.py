@@ -5,7 +5,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .checksum import compute
-from .parser import _OP_SYMBOLS
+from .parser import _OP_SYMBOLS, resolve_repeat_count
 
 
 class EncodeError(Exception):
@@ -200,6 +200,47 @@ def encode_message(
                 continue
 
         bit_offset = writer.pos
+        repeat = field.get("repeat")
+
+        if repeat is not None:
+            if name not in values:
+                raise EncodeError(f"missing value for field '{name}'")
+            provided = values[name]
+            if not isinstance(provided, list):
+                raise EncodeError(
+                    f"field '{name}': expected a list of {field['type']} values "
+                    f"(repeat-driven by '{repeat['field']}'), got {type(provided).__name__}"
+                )
+            # resolve (and bound) the counter before comparing array lengths
+            count = resolve_repeat_count(name, repeat, raw_values, error_cls=EncodeError)
+            if len(provided) != count:
+                raise EncodeError(
+                    f"field '{name}': repeat counter '{repeat['field']}' requires exactly "
+                    f"{count} value(s), got {len(provided)}"
+                )
+            consumed.add(name)
+            displays: List[Any] = []
+            raws: List[Any] = []
+            for index, item in enumerate(provided):
+                element_field = dict(field)
+                element_field["name"] = f"{name}[{index}]"
+                display, raw = _to_raw(element_field, item)
+                _write_field(writer, field, raw)
+                displays.append(display)
+                if field["type"] in ("uint", "int"):
+                    raws.append(raw)
+            entry: Dict[str, Any] = {
+                "name": name,
+                "bit_offset": bit_offset,
+                "bit_length": field["bit_length"],
+                "count": count,
+                "value": displays,
+            }
+            if field["type"] in ("uint", "int"):
+                entry["raw_value"] = raws
+            out_fields.append(entry)
+            # repeated fields are arrays: never used as condition/counter sources
+            continue
 
         if checksum_cfg and name == checksum_cfg["field"]:
             if name in values:
